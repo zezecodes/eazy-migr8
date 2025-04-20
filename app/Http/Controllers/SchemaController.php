@@ -76,11 +76,8 @@ class SchemaController extends Controller
             'table' => 'required|string|regex:/^[a-zA-Z_][a-zA-Z0-9_]*$/',
             'columns' => 'required|array',
             'columns.*.name' => 'required|string|regex:/^[a-zA-Z_][a-zA-Z0-9_]*$/',
-            'columns.*.type' => 'required|string|in:string,text,integer,boolean,date,datetime,float,double',
-            'columns.*.modifiers' => 'nullable|array',
-            'columns.*.modifiers.nullable' => 'boolean',
-            'columns.*.modifiers.unique' => 'boolean',
-            'columns.*.modifiers.default' => 'nullable',
+            'columns.*.type' => 'required|string|in:string,text,integer,boolean,date,datetime,float,double,foreignId,enum',            'columns.*.modifiers' => 'nullable|array',
+            'columns.*.modifiers' => 'sometimes|array',
         ];
 
         $validator = Validator::make($request->all(), $rules);
@@ -125,26 +122,11 @@ class SchemaController extends Controller
             return response(['error' => 'Table already exists.'], 409);
         }
 
+
         Schema::connection($connectionName)->create($request->table, function (Blueprint $table) use ($request) {
             $table->id();
             foreach ($request->columns as $column) {
-                $type = $column['type'];
-                $name = $column['name'];
-                $columnObj = $table->$type($name);
-
-                $modifiers = $column['modifiers'] ?? [];
-
-                if (!empty($modifiers['nullable'])) {
-                    $columnObj->nullable();
-                }
-
-                if (isset($modifiers['default'])) {
-                    $columnObj->default($modifiers['default']);
-                }
-
-                if (!empty($modifiers['unique'])) {
-                    $table->unique($name);
-                }
+                $this->applyColumnDefinition($table, $column);
             }
             $table->timestamps();
         });
@@ -188,4 +170,75 @@ class SchemaController extends Controller
 
         return response(['message' => 'Table rolled back (dropped) successfully.']);
     }
+
+    private function applyColumnDefinition(Blueprint $table, array $column)
+    {
+        $type = $column['type'];
+        $name = $column['name'];
+        $modifiers = $column['modifiers'] ?? [];
+
+        // Handle foreignId
+        if ($type === 'foreignId') {
+            $columnObj = $table->foreignId($name);
+
+            if (!empty($modifiers['constrained'])) {
+                if (is_string($modifiers['constrained'])) {
+                    $columnObj->constrained($modifiers['constrained']);
+                } else {
+                    $columnObj->constrained();
+                }
+            }
+
+            if (!empty($modifiers['onDelete'])) {
+                $columnObj->onDelete($modifiers['onDelete']);
+            }
+
+            if (!empty($modifiers['onUpdate'])) {
+                $columnObj->onUpdate($modifiers['onUpdate']);
+            }
+
+        }
+
+        // Handle enum
+        if ($type === 'enum' && isset($modifiers['values']) && is_array($modifiers['values'])) {
+            $columnObj = $table->enum($name, $modifiers['values']);
+        }
+        // Handle string with length
+        elseif ($type === 'string' && isset($modifiers['length'])) {
+            $columnObj = $table->string($name, $modifiers['length']);
+        } else {
+            $columnObj = $table->$type($name);
+        }
+
+        // Common modifiers
+        if (!empty($modifiers['nullable'])) {
+            $columnObj->nullable();
+        }
+
+        if (!empty($modifiers['unsigned']) && method_exists($columnObj, 'unsigned')) {
+            $columnObj->unsigned();
+        }
+
+        if (array_key_exists('default', $modifiers)) {
+            $columnObj->default($modifiers['default']);
+        }
+
+        if (!empty($modifiers['comment'])) {
+            $columnObj->comment($modifiers['comment']);
+        }
+
+        // Indexes
+        if (!empty($modifiers['unique'])) {
+            $table->unique($name);
+        }
+
+        if (!empty($modifiers['index'])) {
+            $table->index($name);
+        }
+
+        if (!empty($modifiers['primary'])) {
+            $table->primary($name);
+        }
+    }
+
 }
