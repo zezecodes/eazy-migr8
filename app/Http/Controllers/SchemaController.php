@@ -2,126 +2,74 @@
 
 namespace App\Http\Controllers;
 
-use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Auth;
-use Illuminate\Support\Facades\Config;
-use Illuminate\Support\Facades\Schema;
+use App\Http\Requests\AddColumnsRequest;
+use App\Http\Requests\GenerateMigrationRequest;
+use App\Http\Requests\RemoveColumnRequest;
+use App\Http\Requests\RollbackRequest;
+use App\Http\Requests\RunMigrationRequest;
+use App\Http\Requests\StoreDbConfigRequest;
+use App\Services\DatabaseConnectionService;
+use App\Services\MigrationGeneratorService;
 use Illuminate\Database\Schema\Blueprint;
-use Illuminate\Support\Facades\Validator;
-use Illuminate\Support\Facades\DB;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Schema;
 
 class SchemaController extends Controller
 {
-    public function storeConfig(Request $request)
-    {
-        $rules = [
-            'driver' => 'required|in:mysql,pgsql,sqlite',
-            'host' => 'required|string',
-            'port' => 'required|numeric',
-            'database' => 'required|string',
-            'username' => 'required|string',
-            'password' => 'sometimes|string',
-        ];
+    public function __construct(
+        private DatabaseConnectionService $db,
+        private MigrationGeneratorService $migrator,
+    ) {}
 
-        $validator = Validator::make($request->all(), $rules);
-        
-        if ($validator->fails()) {
-            return response(['message' => 'Validation failed', 'errors' => $validator->errors()], 422);
-        }
+    public function storeConfig(StoreDbConfigRequest $request): JsonResponse
+    {
+        $validated = $request->validated();
 
         $user = Auth::user();
-        
-        // Store the validated data, not the rules
-        $validatedData = $validator->validated();
-        $user->db_config = encrypt(json_encode($validatedData));
+        $user->db_config = encrypt(json_encode($validated));
         $user->save();
 
-        return response([
-            'message' => 'DB config saved.',
-            'config' => $validatedData
+        return response()->json([
+            'message' => 'Database configuration saved.',
+            'driver' => $validated['driver'],
+            'host' => $validated['host'],
+            'port' => $validated['port'],
+            'database' => $validated['database'],
         ]);
     }
 
-    // Generate migration preview (optional)
-    public function generateMigration(Request $request)
+    public function generateMigration(GenerateMigrationRequest $request): JsonResponse
     {
-        $rules = [
-            'table' => 'required|string|regex:/^[a-zA-Z_][a-zA-Z0-9_]*$/',
-            'columns' => 'required|array',
-            'columns.*.name' => 'required|string|regex:/^[a-zA-Z_][a-zA-Z0-9_]*$/',
-            'columns.*.type' => 'required|string|in:string,text,integer,boolean,date,datetime,float,double',
-            'columns.*.modifiers' => 'nullable|array',
-            'columns.*.modifiers.nullable' => 'boolean',
-            'columns.*.modifiers.unique' => 'boolean',
-            'columns.*.modifiers.default' => 'nullable',
-        ];
+        $content = $this->migrator->generateCreateTableContent($request->table, $request->columns);
+        $filename = $this->migrator->buildFilename("create", $request->table);
 
-        $validator = Validator::make($request->all(), $rules);
-        
-        if ($validator->fails()) {
-            return response(['message' => 'Validation failed', 'errors' => $validator->errors()], 422);
-        }
-
-        return response([
+        return response()->json([
             'message' => 'Migration preview generated.',
             'table' => $request->table,
-            'columns' => $request->columns
+            'columns' => $request->columns,
+            'filename' => $filename,
+            'migration_content' => $content,
         ]);
     }
 
-    // Safely run migration to create table
-    public function runMigration(Request $request)
+    public function runMigration(RunMigrationRequest $request): JsonResponse
     {
-        $rules = [
-            'table' => 'required|string|regex:/^[a-zA-Z_][a-zA-Z0-9_]*$/',
-            'columns' => 'required|array',
-            'columns.*.name' => 'required|string|regex:/^[a-zA-Z_][a-zA-Z0-9_]*$/',
-            'columns.*.type' => 'required|string|in:string,text,integer,boolean,date,datetime,float,double,foreignId,enum',            'columns.*.modifiers' => 'nullable|array',
-            'columns.*.modifiers' => 'sometimes|array',
-        ];
-
-        $validator = Validator::make($request->all(), $rules);
-        
-        if ($validator->fails()) {
-            return response(['message' => 'Validation failed', 'errors' => $validator->errors()], 422);
-        }
-
-        $user = Auth::user();
-        $config = json_decode(decrypt($user->db_config), true);
-        $connectionName = "user_" . $user->id;
-        $database = $config['database'];
-
-        Config::set("database.connections.$connectionName", [
-            'driver' => $config['driver'],
-            'host' => $config['host'],
-            'port' => $config['port'],
-            'database' => null,
-            'username' => $config['username'],
-            'password' => $config['password'],
-            'charset' => 'utf8mb4',
-            'collation' => 'utf8mb4_unicode_ci',
-        ]);
-
         try {
-            DB::connection($connectionName)->statement("CREATE DATABASE IF NOT EXISTS `$database`");
+            $this->db->connectWithoutDatabase(Auth::user());
+            $this->db->createDatabaseIfNotExists();
+            $this->db->setDatabase();
+        } catch (\RuntimeException $e) {
+            return response()->json(['error' => $e->getMessage()], 400);
         } catch (\Exception $e) {
-            return response()->json(['error' => 'Unable to create database: ' . $e->getMessage()], 500);
+            return response()->json(['error' => 'Unable to connect to database.'], 500);
         }
 
-        Config::set("database.connections.$connectionName.database", $database);
-
-        DB::purge($connectionName);
-        DB::reconnect($connectionName);
-
-        $protectedTables = ['users', 'migrations', 'password_resets'];
-        if (in_array($request->table, $protectedTables)) {
-            return response(['error' => 'Table name is protected.'], 403);
-        }
+        $connectionName = $this->db->getConnectionName();
 
         if (Schema::connection($connectionName)->hasTable($request->table)) {
-            return response(['error' => 'Table already exists.'], 409);
+            return response()->json(['error' => 'Table already exists.'], 409);
         }
-
 
         Schema::connection($connectionName)->create($request->table, function (Blueprint $table) use ($request) {
             $table->id();
@@ -131,114 +79,157 @@ class SchemaController extends Controller
             $table->timestamps();
         });
 
-        return response(['message' => 'Table created successfully.']);
+        $content = $this->migrator->generateCreateTableContent($request->table, $request->columns);
+        $filename = $this->migrator->buildFilename("create", $request->table);
+
+        return response()->json([
+            'message' => 'Table created successfully.',
+            'filename' => $filename,
+            'migration_content' => $content,
+        ]);
     }
 
-    // Rollback (drop) the created table
-    public function rollbackMigration(Request $request)
+    public function addColumnsToTable(AddColumnsRequest $request): JsonResponse
     {
-        $rules = [
-            'table' => 'required|string|regex:/^[a-zA-Z_][a-zA-Z0-9_]*$/',
-        ];
-
-        $validator = Validator::make($request->all(), $rules);
-        
-        if ($validator->fails()) {
-            return response(['message' => 'Validation failed', 'errors' => $validator->errors()], 422);
+        try {
+            $this->db->connect(Auth::user());
+        } catch (\RuntimeException $e) {
+            return response()->json(['error' => $e->getMessage()], 400);
         }
 
-        $user = Auth::user();
-        $config = json_decode(decrypt($user->db_config), true);
-        $connectionName = "user_" . $user->id;
-
-        Config::set("database.connections.$connectionName", [
-            'driver' => $config['driver'],
-            'host' => $config['host'],
-            'port' => $config['port'],
-            'database' => $config['database'],
-            'username' => $config['username'],
-            'password' => $config['password'],
-            'charset' => 'utf8mb4',
-            'collation' => 'utf8mb4_unicode_ci',
-        ]);
+        $connectionName = $this->db->getConnectionName();
 
         if (!Schema::connection($connectionName)->hasTable($request->table)) {
-            return response(['error' => 'Table does not exist.'], 404);
+            return response()->json(['error' => 'Table does not exist.'], 404);
+        }
+
+        $columnNames = array_column($request->columns, 'name');
+        $existingColumns = Schema::connection($connectionName)->getColumnListing($request->table);
+        $duplicates = array_intersect($columnNames, $existingColumns);
+
+        if (!empty($duplicates)) {
+            return response()->json([
+                'error' => 'The following columns already exist: ' . implode(', ', $duplicates),
+            ], 409);
+        }
+
+        Schema::connection($connectionName)->table($request->table, function (Blueprint $table) use ($request) {
+            foreach ($request->columns as $column) {
+                $this->applyColumnDefinition($table, $column);
+            }
+        });
+
+        $content = $this->migrator->generateAddColumnsContent($request->table, $request->columns);
+        $filename = $this->migrator->buildFilename("add_columns_to", $request->table);
+
+        return response()->json([
+            'message' => 'Columns added successfully.',
+            'filename' => $filename,
+            'migration_content' => $content,
+        ]);
+    }
+
+    public function removeColumnFromTable(RemoveColumnRequest $request): JsonResponse
+    {
+        try {
+            $this->db->connect(Auth::user());
+        } catch (\RuntimeException $e) {
+            return response()->json(['error' => $e->getMessage()], 400);
+        }
+
+        $connectionName = $this->db->getConnectionName();
+
+        if (!Schema::connection($connectionName)->hasTable($request->table)) {
+            return response()->json(['error' => 'Table does not exist.'], 404);
+        }
+
+        if (!Schema::connection($connectionName)->hasColumn($request->table, $request->column)) {
+            return response()->json(['error' => 'Column does not exist.'], 404);
+        }
+
+        Schema::connection($connectionName)->table($request->table, function (Blueprint $table) use ($request) {
+            $table->dropColumn($request->column);
+        });
+
+        $content = $this->migrator->generateDropColumnsContent($request->table, [$request->column]);
+        $filename = $this->migrator->buildFilename("drop_{$request->column}_from", $request->table);
+
+        return response()->json([
+            'message' => 'Column removed successfully.',
+            'filename' => $filename,
+            'migration_content' => $content,
+        ]);
+    }
+
+    public function dropTable(RollbackRequest $request): JsonResponse
+    {
+        try {
+            $this->db->connect(Auth::user());
+        } catch (\RuntimeException $e) {
+            return response()->json(['error' => $e->getMessage()], 400);
+        }
+
+        $connectionName = $this->db->getConnectionName();
+
+        if (!Schema::connection($connectionName)->hasTable($request->table)) {
+            return response()->json(['error' => 'Table does not exist.'], 404);
         }
 
         Schema::connection($connectionName)->drop($request->table);
 
-        return response(['message' => 'Table rolled back (dropped) successfully.']);
+        return response()->json(['message' => 'Table dropped successfully.']);
     }
 
-    private function applyColumnDefinition(Blueprint $table, array $column)
+    private function applyColumnDefinition(Blueprint $table, array $column): void
     {
         $type = $column['type'];
         $name = $column['name'];
         $modifiers = $column['modifiers'] ?? [];
 
-        // Handle foreignId
         if ($type === 'foreignId') {
-            $columnObj = $table->foreignId($name);
-
+            $col = $table->foreignId($name);
             if (!empty($modifiers['constrained'])) {
-                if (is_string($modifiers['constrained'])) {
-                    $columnObj->constrained($modifiers['constrained']);
-                } else {
-                    $columnObj->constrained();
-                }
+                $col = is_string($modifiers['constrained'])
+                    ? $col->constrained($modifiers['constrained'])
+                    : $col->constrained();
             }
-
             if (!empty($modifiers['onDelete'])) {
-                $columnObj->onDelete($modifiers['onDelete']);
+                $col->onDelete($modifiers['onDelete']);
             }
-
             if (!empty($modifiers['onUpdate'])) {
-                $columnObj->onUpdate($modifiers['onUpdate']);
+                $col->onUpdate($modifiers['onUpdate']);
             }
-
+            return;
         }
 
-        // Handle enum
         if ($type === 'enum' && isset($modifiers['values']) && is_array($modifiers['values'])) {
-            $columnObj = $table->enum($name, $modifiers['values']);
-        }
-        // Handle string with length
-        elseif ($type === 'string' && isset($modifiers['length'])) {
-            $columnObj = $table->string($name, $modifiers['length']);
+            $col = $table->enum($name, $modifiers['values']);
+        } elseif ($type === 'string' && isset($modifiers['length'])) {
+            $col = $table->string($name, $modifiers['length']);
         } else {
-            $columnObj = $table->$type($name);
+            $col = $table->$type($name);
         }
 
-        // Common modifiers
         if (!empty($modifiers['nullable'])) {
-            $columnObj->nullable();
+            $col->nullable();
         }
-
-        if (!empty($modifiers['unsigned']) && method_exists($columnObj, 'unsigned')) {
-            $columnObj->unsigned();
+        if (!empty($modifiers['unsigned']) && method_exists($col, 'unsigned')) {
+            $col->unsigned();
         }
-
         if (array_key_exists('default', $modifiers)) {
-            $columnObj->default($modifiers['default']);
+            $col->default($modifiers['default']);
         }
-
         if (!empty($modifiers['comment'])) {
-            $columnObj->comment($modifiers['comment']);
+            $col->comment($modifiers['comment']);
         }
-
-        // Indexes
         if (!empty($modifiers['unique'])) {
             $table->unique($name);
         }
-
         if (!empty($modifiers['index'])) {
             $table->index($name);
         }
-
         if (!empty($modifiers['primary'])) {
             $table->primary($name);
         }
     }
-
 }
